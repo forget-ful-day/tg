@@ -1,0 +1,220 @@
+# server.py
+from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
+import json
+import os
+from datetime import datetime
+import uuid
+
+app = Flask(__name__, static_folder='.')
+CORS(app)
+
+# Файл для хранения данных
+DATA_FILE = 'catalog_data.json'
+
+def load_data():
+    """Загрузка данных из файла"""
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {
+        'catalog': {},
+        'carts': {},
+        'orders': {}
+    }
+
+def save_data(data):
+    """Сохранение данных в файл"""
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+@app.route('/')
+def serve_index():
+    """Главная страница"""
+    return send_from_directory('.', 'catalog.html')
+
+@app.route('/api/catalog')
+def get_catalog():
+    """Получение каталога товаров"""
+    data = load_data()
+    return jsonify(data.get('catalog', {}))
+
+@app.route('/api/cart/<user_id>')
+def get_cart(user_id):
+    """Получение корзины пользователя"""
+    data = load_data()
+    cart = data.get('carts', {}).get(user_id, {})
+    return jsonify(cart)
+
+@app.route('/api/cart/<user_id>', methods=['POST'])
+def update_cart(user_id):
+    """Обновление корзины пользователя"""
+    data = load_data()
+    cart_data = request.json
+    
+    if 'carts' not in data:
+        data['carts'] = {}
+    
+    if user_id not in data['carts']:
+        data['carts'][user_id] = {}
+    
+    # Обновляем корзину
+    for item_id, quantity in cart_data.items():
+        if quantity > 0:
+            data['carts'][user_id][item_id] = quantity
+        elif item_id in data['carts'][user_id]:
+            del data['carts'][user_id][item_id]
+    
+    save_data(data)
+    return jsonify({'success': True, 'cart': data['carts'][user_id]})
+
+@app.route('/api/order', methods=['POST'])
+def create_order():
+    """Создание заказа"""
+    order_data = request.json
+    user_id = order_data.get('user_id')
+    
+    if not user_id:
+        return jsonify({'success': False, 'error': 'User ID is required'}), 400
+    
+    data = load_data()
+    
+    # Получаем корзину пользователя
+    cart = data.get('carts', {}).get(user_id, {})
+    if not cart:
+        return jsonify({'success': False, 'error': 'Cart is empty'}), 400
+    
+    # Генерируем ID заказа
+    order_id = str(uuid.uuid4())[:8].upper()
+    
+    # Собираем информацию о заказе
+    order_items = []
+    total_amount = 0
+    
+    for item_id, quantity in cart.items():
+        # Находим товар в каталоге
+        item_info = None
+        for category in data.get('catalog', {}).values():
+            if 'items' in category and item_id in category['items']:
+                item_info = category['items'][item_id]
+                break
+        
+        if item_info:
+            item_total = item_info.get('price', 0) * quantity
+            total_amount += item_total
+            order_items.append({
+                'id': item_id,
+                'name': item_info.get('name', 'Товар'),
+                'quantity': quantity,
+                'price': item_info.get('price', 0),
+                'total': item_total
+            })
+    
+    # Создаем заказ
+    order = {
+        'id': order_id,
+        'user_id': user_id,
+        'date': datetime.now().isoformat(),
+        'items': order_items,
+        'total': total_amount,
+        'status': 'pending'
+    }
+    
+    # Сохраняем заказ
+    if 'orders' not in data:
+        data['orders'] = {}
+    
+    if user_id not in data['orders']:
+        data['orders'][user_id] = []
+    
+    data['orders'][user_id].append(order)
+    
+    # Очищаем корзину
+    if user_id in data['carts']:
+        data['carts'][user_id] = {}
+    
+    save_data(data)
+    
+    return jsonify({
+        'success': True,
+        'order_id': order_id,
+        'order': order
+    })
+
+@app.route('/api/orders/<user_id>')
+def get_orders(user_id):
+    """Получение заказов пользователя"""
+    data = load_data()
+    orders = data.get('orders', {}).get(user_id, [])
+    return jsonify(orders)
+
+@app.route('/api/init_data')
+def init_data():
+    """Инициализация данных для демо"""
+    demo_catalog = {
+        'electronics': {
+            'id': 'electronics',
+            'name': 'Электроника',
+            'icon': '📱',
+            'description': 'Смартфоны, ноутбуки, гаджеты',
+            'items': {
+                'smartphone': {
+                    'id': 'smartphone',
+                    'name': 'iPhone 15 Pro',
+                    'description': 'Флагманский смартфон Apple с процессором A17 Pro',
+                    'price': 99999,
+                    'currency': 'RUB',
+                    'specs': {
+                        'Экран': '6.1" Super Retina XDR',
+                        'Процессор': 'A17 Pro',
+                        'Память': '256 ГБ',
+                        'Камера': '48 Мп'
+                    }
+                },
+                'laptop': {
+                    'id': 'laptop',
+                    'name': 'MacBook Air M3',
+                    'description': 'Ультратонкий ноутбук с чипом Apple M3',
+                    'price': 129999,
+                    'currency': 'RUB',
+                    'specs': {
+                        'Экран': '13.6" Liquid Retina',
+                        'Процессор': 'Apple M3',
+                        'Память': '512 ГБ',
+                        'Вес': '1.24 кг'
+                    }
+                }
+            }
+        },
+        'clothing': {
+            'id': 'clothing',
+            'name': 'Одежда',
+            'icon': '👕',
+            'description': 'Модная одежда и аксессуары',
+            'items': {
+                'tshirt': {
+                    'id': 'tshirt',
+                    'name': 'Футболка Premium',
+                    'description': 'Хлопковая футболка премиум-класса',
+                    'price': 1999,
+                    'currency': 'RUB',
+                    'specs': {
+                        'Материал': '100% хлопок',
+                        'Размеры': 'XS-XXL',
+                        'Цвета': 'Черный, Белый, Серый'
+                    }
+                }
+            }
+        }
+    }
+    
+    data = load_data()
+    data['catalog'] = demo_catalog
+    save_data(data)
+    
+    return jsonify({'success': True, 'message': 'Demo data initialized'})
+
+if __name__ == '__main__':
+    print("🚀 Сервер запущен на http://localhost:5000")
+    print("📱 Для Mini App используйте URL: https://ваш-домен/catalog.html")
+    app.run(host='0.0.0.0', port=5000, debug=True)
