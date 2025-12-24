@@ -1,361 +1,407 @@
 require('dotenv').config();
-const TelegramBot = require('node-telegram-bot-api');
-const sqlite3 = require('sqlite3').verbose();
+const express = require('express');
+const database = require('./config/database');
+const botService = require('./services/botService');
 
-// Получаем токен из переменных окружения
-const token = process.env.BOT_TOKEN;
-
-if (!token) {
-    console.error('Ошибка: BOT_TOKEN не найден в .env файле');
-    process.exit(1);
-}
-
-// Создаем экземпляр бота
-const bot = new TelegramBot(token, { polling: true });
-
-// Подключаем базу данных
-const db = new sqlite3.Database('./data/products.db');
-
-console.log('✅ Бот запущен!');
-console.log('📁 База данных подключена');
-
-// Обработка команды /start
-bot.onText(/\/start/, (msg) => {
-    const chatId = msg.chat.id;
-    const username = msg.from.first_name;
-    
-    const keyboard = {
-        reply_markup: {
-            keyboard: [
-                ['📁 Каталог', '🛒 Корзина'],
-                ['🔍 Поиск', '📞 Контакты'],
-                ['ℹ️ Помощь']
-            ],
-            resize_keyboard: true
-        }
-    };
-    
-    bot.sendMessage(chatId, `Привет, ${username}! 👋\nДобро пожаловать в наш магазин!\nИспользуйте кнопки ниже:`, keyboard);
-});
-
-// Команда /catalog или кнопка "Каталог"
-bot.onText(/\/catalog|📁 Каталог/, (msg) => {
-    const chatId = msg.chat.id;
-    showCategories(chatId);
-});
-
-// Показ категорий
-function showCategories(chatId) {
-    db.all('SELECT * FROM categories ORDER BY name', [], (err, categories) => {
-        if (err) {
-            bot.sendMessage(chatId, '❌ Ошибка при загрузке категорий');
-            return;
-        }
-        
-        if (categories.length === 0) {
-            bot.sendMessage(chatId, '📭 Категории пока не добавлены');
-            return;
-        }
-        
-        const keyboard = {
-            reply_markup: {
-                inline_keyboard: categories.map(cat => [
-                    {
-                        text: cat.name,
-                        callback_data: `category_${cat.id}`
-                    }
-                ])
-            }
-        };
-        
-        bot.sendMessage(chatId, '📂 Выберите категорию:', keyboard);
-    });
-}
-
-// Обработка callback запросов (кнопки под сообщением)
-bot.on('callback_query', (callbackQuery) => {
-    const msg = callbackQuery.message;
-    const data = callbackQuery.data;
-    
-    if (data.startsWith('category_')) {
-        const categoryId = data.split('_')[1];
-        showProducts(msg.chat.id, categoryId);
+class Application {
+    constructor() {
+        this.app = express();
+        this.port = process.env.PORT || 3000;
     }
-    
-    if (data.startsWith('product_')) {
-        const productId = data.split('_')[1];
-        showProductDetails(msg.chat.id, productId);
+
+    async start() {
+        try {
+            console.log('🚀 Запуск приложения...');
+            
+            // Подключаем базу данных
+            await database.connect();
+            
+            // Инициализируем бота
+            botService.initialize();
+            
+            // Настраиваем Express (для вебхуков если нужно)
+            this.setupExpress();
+            
+            // Запускаем сервер
+            this.app.listen(this.port, () => {
+                console.log(`✅ Сервер запущен на порту ${this.port}`);
+                console.log(`🤖 Бот готов к работе!`);
+                console.log('\n📋 Доступные команды:');
+                botService.commands.forEach(cmd => {
+                    console.log(`   ${cmd.command} - ${cmd.description}`);
+                });
+            });
+            
+            // Обработка завершения
+            this.setupGracefulShutdown();
+            
+        } catch (error) {
+            console.error('❌ Ошибка запуска приложения:', error);
+            process.exit(1);
+        }
     }
-    
-    if (data.startsWith('back_to_category_')) {
-        const categoryId = data.split('_')[3];
-        showProducts(msg.chat.id, categoryId);
-    }
-    
-    if (data.startsWith('add_to_cart_')) {
-        const productId = data.split('_')[3];
-        addToCart(msg.chat.id, productId);
-    }
-    
-    bot.answerCallbackQuery(callbackQuery.id);
-});
 
-// Показ товаров в категории
-function showProducts(chatId, categoryId) {
-    db.get('SELECT name FROM categories WHERE id = ?', [categoryId], (err, category) => {
-        if (err || !category) {
-            bot.sendMessage(chatId, '❌ Категория не найдена');
-            return;
-        }
+    setupExpress() {
+        // Middleware
+        this.app.use(express.json());
+        this.app.use(express.urlencoded({ extended: true }));
         
-        db.all('SELECT * FROM products WHERE category_id = ? ORDER BY name', [categoryId], (err, products) => {
-            if (err) {
-                bot.sendMessage(chatId, '❌ Ошибка при загрузке товаров');
-                return;
-            }
-            
-            if (products.length === 0) {
-                bot.sendMessage(chatId, `📭 В категории "${category.name}" пока нет товаров`);
-                return;
-            }
-            
-            // Показываем первые 5 товаров
-            const productsToShow = products.slice(0, 5);
-            
-            const message = `📦 *${category.name}*\n\n${productsToShow.map((product, index) => {
-                return `${index + 1}. ${product.name}\n   �� ${product.price} $\n   📦 ${product.stock} шт.\n`;
-            }).join('\n')}`;
-            
-            const keyboard = {
-                reply_markup: {
-                    inline_keyboard: [
-                        ...productsToShow.map(product => [
-                            {
-                                text: `🛒 ${product.name} - ${product.price}$`,
-                                callback_data: `product_${product.id}`
-                            }
-                        ]),
-                        [{ text: '◀️ Назад к категориям', callback_data: 'back_to_categories' }]
-                    ]
-                },
-                parse_mode: 'Markdown'
-            };
-            
-            bot.sendMessage(chatId, message, keyboard);
-        });
-    });
-}
-
-// Показ деталей товара
-function showProductDetails(chatId, productId) {
-    db.get(`
-        SELECT p.*, c.name as category_name 
-        FROM products p 
-        LEFT JOIN categories c ON p.category_id = c.id 
-        WHERE p.id = ?
-    `, [productId], (err, product) => {
-        if (err || !product) {
-            bot.sendMessage(chatId, '❌ Товар не найден');
-            return;
-        }
-        
-        const message = `
-📦 *${product.name}*
-
-📝 Описание: ${product.description || 'Нет описания'}
-💰 Цена: ${product.price} $
-📂 Категория: ${product.category_name}
-📦 В наличии: ${product.stock} шт.
-${product.stock > 0 ? '✅ В наличии' : '❌ Нет в наличии'}
-        `.trim();
-        
-        const keyboard = {
-            reply_markup: {
-                inline_keyboard: [
-                    [
-                        {
-                            text: '🛒 Добавить в корзину',
-                            callback_data: `add_to_cart_${product.id}`
-                        }
-                    ],
-                    [
-                        {
-                            text: '◀️ Назад к товарам',
-                            callback_data: `back_to_category_${product.category_id}`
-                        }
-                    ]
-                ]
-            },
-            parse_mode: 'Markdown'
-        };
-        
-        bot.sendMessage(chatId, message, keyboard);
-    });
-}
-
-// Добавление в корзину (упрощенная версия)
-function addToCart(chatId, productId) {
-    db.get('SELECT * FROM products WHERE id = ?', [productId], (err, product) => {
-        if (err || !product) {
-            bot.sendMessage(chatId, '❌ Товар не найден');
-            return;
-        }
-        
-        if (product.stock <= 0) {
-            bot.sendMessage(chatId, '❌ Товар закончился');
-            return;
-        }
-        
-        // В реальном приложении здесь была бы работа с таблицей корзины
-        // Для упрощения просто показываем сообщение
-        bot.sendMessage(chatId, 
-            `✅ Товар "${product.name}" добавлен в корзину!\n\n` +
-            `💰 Цена: ${product.price} $\n` +
-            `Используйте команду /cart для просмотра корзины`
-        );
-    });
-}
-
-// Команда /cart - показать корзину
-bot.onText(/\/cart|🛒 Корзина/, (msg) => {
-    const chatId = msg.chat.id;
-    
-    // В реальном приложении здесь бы загружались товары из корзины
-    bot.sendMessage(chatId, 
-        `🛒 *Ваша корзина*\n\n` +
-        `1. iPhone 15 Pro - 999.99 $ x 1\n` +
-        `2. Чехол для iPhone - 29.99 $ x 2\n\n` +
-        `📦 Всего товаров: 3\n` +
-        `💰 Общая сумма: 1059.97 $\n\n` +
-        `Для оформления заказа свяжитесь с нами: /contacts`,
-        { parse_mode: 'Markdown' }
-    );
-});
-
-// Команда /search - поиск товаров
-bot.onText(/\/search|🔍 Поиск/, (msg) => {
-    const chatId = msg.chat.id;
-    
-    bot.sendMessage(chatId, '🔍 Введите название товара для поиска:');
-});
-
-// Обработка поисковых запросов
-bot.on('message', (msg) => {
-    const chatId = msg.chat.id;
-    const text = msg.text;
-    
-    // Если это не команда и не callback, проверяем не поиск ли это
-    if (text && !text.startsWith('/') && 
-        !['📁 Каталог', '🛒 Корзина', '�� Поиск', '📞 Контакты', 'ℹ️ Помощь'].includes(text)) {
-        
-        // Проверяем предыдущее сообщение
-        bot.getChat(chatId).then(() => {
-            // Упрощенный поиск
-            db.all('SELECT * FROM products WHERE name LIKE ? LIMIT 5', [`%${text}%`], (err, products) => {
-                if (err) {
-                    bot.sendMessage(chatId, '❌ Ошибка при поиске');
-                    return;
-                }
-                
-                if (products.length === 0) {
-                    bot.sendMessage(chatId, `🔍 По запросу "${text}" ничего не найдено`);
-                    return;
-                }
-                
-                const message = `🔍 *Результаты поиска по запросу "${text}"*\n\n` +
-                    products.map((product, index) => {
-                        return `${index + 1}. ${product.name}\n   💰 ${product.price} $\n   📦 ${product.stock} шт.`;
-                    }).join('\n\n');
-                
-                bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+        // Health check endpoint
+        this.app.get('/health', (req, res) => {
+            res.status(200).json({
+                status: 'OK',
+                timestamp: new Date().toISOString(),
+                database: database.isConnected ? 'connected' : 'disconnected',
+                bot: botService.bot ? 'running' : 'stopped'
             });
         });
-    }
-});
-
-// Команда /contacts
-bot.onText(/\/contacts|📞 Контакты/, (msg) => {
-    const chatId = msg.chat.id;
-    
-    bot.sendMessage(chatId, 
-        `📞 *Наши контакты*\n\n` +
-        `📧 Email: shop@example.com\n` +
-        `📱 Телефон: +7 (999) 123-45-67\n` +
-        `🕐 Часы работы: 9:00 - 21:00\n\n` +
-        `📍 Адрес: г. Москва, ул. Примерная, д. 1\n\n` +
-        `Для связи с менеджером: @shop_manager`,
-        { parse_mode: 'Markdown' }
-    );
-});
-
-// Команда /help
-bot.onText(/\/help|ℹ️ Помощь/, (msg) => {
-    const chatId = msg.chat.id;
-    
-    bot.sendMessage(chatId, 
-        `ℹ️ *Помощь*\n\n` +
-        `*Основные команды:*\n` +
-        `/start - Главное меню\n` +
-        `/catalog - Каталог товаров\n` +
-        `/cart - Корзина\n` +
-        `/search - Поиск товаров\n` +
-        `/contacts - Контакты\n` +
-        `/help - Эта справка\n\n` +
-        `*Как сделать заказ:*\n` +
-        `1. Выберите товар в каталоге\n` +
-        `2. Добавьте в корзину\n` +
-        `3. Свяжитесь с нами для оформления\n\n` +
-        `💡 Просто введите название товара для поиска!`,
-        { parse_mode: 'Markdown' }
-    );
-});
-
-// Команда для админов - статистика
-bot.onText(/\/stats/, (msg) => {
-    const chatId = msg.chat.id;
-    
-    // Простая проверка на админа (в реальном приложении нужна настоящая проверка)
-    if (msg.from.username !== 'ваш_username') {
-        return;
-    }
-    
-    db.all(`
-        SELECT 
-            (SELECT COUNT(*) FROM categories) as categories_count,
-            (SELECT COUNT(*) FROM products) as products_count,
-            (SELECT SUM(stock) FROM products) as total_stock,
-            (SELECT SUM(price * stock) FROM products) as total_value
-    `, [], (err, result) => {
-        if (err) {
-            bot.sendMessage(chatId, '❌ Ошибка получения статистики');
-            return;
-        }
         
-        const stats = result[0];
-        bot.sendMessage(chatId, 
-            `📊 *Статистика магазина*\n\n` +
-            `📂 Категорий: ${stats.categories_count}\n` +
-            `📦 Товаров: ${stats.products_count}\n` +
-            `📈 Товаров на складе: ${stats.total_stock || 0} шт.\n` +
-            `💰 Общая стоимость: ${Math.round(stats.total_value || 0)} $\n\n` +
-            `🔄 Бот работает: ${Math.round(process.uptime() / 60)} мин.`,
-            { parse_mode: 'Markdown' }
-        );
-    });
-});
+        // Главная страница
+        this.app.get('/', (req, res) => {
+            res.send(`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Telegram Bot</title>
+                    <meta charset="utf-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1">
+                    <style>
+                        body {
+                            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                            max-width: 800px;
+                            margin: 0 auto;
+                            padding: 20px;
+                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                            min-height: 100vh;
+                            color: white;
+                        }
+                        .container {
+                            background: rgba(255, 255, 255, 0.1);
+                            backdrop-filter: blur(10px);
+                            border-radius: 20px;
+                            padding: 40px;
+                            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+                        }
+                        h1 {
+                            text-align: center;
+                            margin-bottom: 30px;
+                            font-size: 2.5em;
+                        }
+                        .status {
+                            display: flex;
+                            justify-content: space-around;
+                            margin: 30px 0;
+                            flex-wrap: wrap;
+                        }
+                        .status-item {
+                            background: rgba(255, 255, 255, 0.2);
+                            padding: 20px;
+                            border-radius: 10px;
+                            text-align: center;
+                            min-width: 150px;
+                            margin: 10px;
+                        }
+                        .commands {
+                            background: rgba(255, 255, 255, 0.2);
+                            padding: 20px;
+                            border-radius: 10px;
+                            margin-top: 30px;
+                        }
+                        .command {
+                            display: flex;
+                            margin: 10px 0;
+                            padding: 10px;
+                            background: rgba(255, 255, 255, 0.1);
+                            border-radius: 5px;
+                        }
+                        .command-cmd {
+                            font-weight: bold;
+                            width: 150px;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h1>🤖 Telegram Bot Dashboard</h1>
+                        
+                        <div class="status">
+                            <div class="status-item">
+                                <div>📊 Status</div>
+                                <div style="font-size: 1.5em; font-weight: bold;">🟢 Running</div>
+                            </div>
+                            <div class="status-item">
+                                <div>🗄️ Database</div>
+                                <div style="font-size: 1.5em; font-weight: bold;">${database.isConnected ? '🟢 Connected' : '🔴 Disconnected'}</div>
+                            </div>
+                            <div class="status-item">
+                                <div>🌐 Port</div>
+                                <div style="font-size: 1.5em; font-weight: bold;">${this.port}</div>
+                            </div>
+                        </div>
+                        
+                        <div class="commands">
+                            <h3>📋 Available Commands:</h3>
+                            ${botService.commands.map(cmd => `
+                                <div class="command">
+                                    <div class="command-cmd">${cmd.command}</div>
+                                    <div>${cmd.description}</div>
+                                </div>
+                            `).join('')}
+                        </div>
+                        
+                        <div style="text-align: center; margin-top: 40px; opacity: 0.8;">
+                            <p>Bot is running and ready to process commands</p>
+                            <p>Check <a href="/health" style="color: #fff; text-decoration: underline;">/health</a> for detailed status</p>
+                        </div>
+                    </div>
+                </body>
+                </html>
+            `);
+        });
+    }
 
-// Обработка ошибок
-bot.on('polling_error', (error) => {
-    console.error('❌ Polling error:', error.message);
-});
+    setupGracefulShutdown() {
+        const shutdown = async (signal) => {
+            console.log(`\n${signal} получен. Завершение работы...`);
+            
+            try {
+                // Отключаем базу данных
+                await database.disconnect();
+                console.log('✅ База данных отключена');
+                
+                // Останавливаем бота
+                if (botService.bot) {
+                    botService.bot.stopPolling();
+                    console.log('✅ Бот остановлен');
+                }
+                
+                console.log('👋 Приложение завершено');
+                process.exit(0);
+                
+            } catch (error) {
+                console.error('❌ Ошибка при завершении:', error);
+                process.exit(1);
+            }
+        };
+        
+        // Обработка сигналов завершения
+        process.on('SIGTERM', () => shutdown('SIGTERM'));
+        process.on('SIGINT', () => shutdown('SIGINT'));
+        
+        // Обработка необработанных ошибок
+        process.on('uncaughtException', (error) => {
+            console.error('🔥 Необработанная ошибка:', error);
+        });
+        
+        process.on('unhandledRejection', (reason, promise) => {
+            console.error('🔥 Необработанный rejection:', reason);
+        });
+    }
+}
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-    console.log('\n🛑 Остановка бота...');
-    db.close();
-    bot.stopPolling();
-    console.log('✅ Бот остановлен');
-    process.exit(0);
-});
+// Запуск приложения
+const app = new Application();
+app.start();require('dotenv').config();
+const express = require('express');
+const database = require('./config/database');
+const botService = require('./services/botService');
 
-console.log('🔄 Бот ожидает сообщений...');
+class Application {
+    constructor() {
+        this.app = express();
+        this.port = process.env.PORT || 3000;
+    }
+
+    async start() {
+        try {
+            console.log('🚀 Запуск приложения...');
+            
+            // Подключаем базу данных
+            await database.connect();
+            
+            // Инициализируем бота
+            botService.initialize();
+            
+            // Настраиваем Express (для вебхуков если нужно)
+            this.setupExpress();
+            
+            // Запускаем сервер
+            this.app.listen(this.port, () => {
+                console.log(`✅ Сервер запущен на порту ${this.port}`);
+                console.log(`🤖 Бот готов к работе!`);
+                console.log('\n📋 Доступные команды:');
+                botService.commands.forEach(cmd => {
+                    console.log(`   ${cmd.command} - ${cmd.description}`);
+                });
+            });
+            
+            // Обработка завершения
+            this.setupGracefulShutdown();
+            
+        } catch (error) {
+            console.error('❌ Ошибка запуска приложения:', error);
+            process.exit(1);
+        }
+    }
+
+    setupExpress() {
+        // Middleware
+        this.app.use(express.json());
+        this.app.use(express.urlencoded({ extended: true }));
+        
+        // Health check endpoint
+        this.app.get('/health', (req, res) => {
+            res.status(200).json({
+                status: 'OK',
+                timestamp: new Date().toISOString(),
+                database: database.isConnected ? 'connected' : 'disconnected',
+                bot: botService.bot ? 'running' : 'stopped'
+            });
+        });
+        
+        // Главная страница
+        this.app.get('/', (req, res) => {
+            res.send(`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Telegram Bot</title>
+                    <meta charset="utf-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1">
+                    <style>
+                        body {
+                            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                            max-width: 800px;
+                            margin: 0 auto;
+                            padding: 20px;
+                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                            min-height: 100vh;
+                            color: white;
+                        }
+                        .container {
+                            background: rgba(255, 255, 255, 0.1);
+                            backdrop-filter: blur(10px);
+                            border-radius: 20px;
+                            padding: 40px;
+                            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+                        }
+                        h1 {
+                            text-align: center;
+                            margin-bottom: 30px;
+                            font-size: 2.5em;
+                        }
+                        .status {
+                            display: flex;
+                            justify-content: space-around;
+                            margin: 30px 0;
+                            flex-wrap: wrap;
+                        }
+                        .status-item {
+                            background: rgba(255, 255, 255, 0.2);
+                            padding: 20px;
+                            border-radius: 10px;
+                            text-align: center;
+                            min-width: 150px;
+                            margin: 10px;
+                        }
+                        .commands {
+                            background: rgba(255, 255, 255, 0.2);
+                            padding: 20px;
+                            border-radius: 10px;
+                            margin-top: 30px;
+                        }
+                        .command {
+                            display: flex;
+                            margin: 10px 0;
+                            padding: 10px;
+                            background: rgba(255, 255, 255, 0.1);
+                            border-radius: 5px;
+                        }
+                        .command-cmd {
+                            font-weight: bold;
+                            width: 150px;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h1>🤖 Telegram Bot Dashboard</h1>
+                        
+                        <div class="status">
+                            <div class="status-item">
+                                <div>📊 Status</div>
+                                <div style="font-size: 1.5em; font-weight: bold;">🟢 Running</div>
+                            </div>
+                            <div class="status-item">
+                                <div>🗄️ Database</div>
+                                <div style="font-size: 1.5em; font-weight: bold;">${database.isConnected ? '🟢 Connected' : '🔴 Disconnected'}</div>
+                            </div>
+                            <div class="status-item">
+                                <div>🌐 Port</div>
+                                <div style="font-size: 1.5em; font-weight: bold;">${this.port}</div>
+                            </div>
+                        </div>
+                        
+                        <div class="commands">
+                            <h3>📋 Available Commands:</h3>
+                            ${botService.commands.map(cmd => `
+                                <div class="command">
+                                    <div class="command-cmd">${cmd.command}</div>
+                                    <div>${cmd.description}</div>
+                                </div>
+                            `).join('')}
+                        </div>
+                        
+                        <div style="text-align: center; margin-top: 40px; opacity: 0.8;">
+                            <p>Bot is running and ready to process commands</p>
+                            <p>Check <a href="/health" style="color: #fff; text-decoration: underline;">/health</a> for detailed status</p>
+                        </div>
+                    </div>
+                </body>
+                </html>
+            `);
+        });
+    }
+
+    setupGracefulShutdown() {
+        const shutdown = async (signal) => {
+            console.log(`\n${signal} получен. Завершение работы...`);
+            
+            try {
+                // Отключаем базу данных
+                await database.disconnect();
+                console.log('✅ База данных отключена');
+                
+                // Останавливаем бота
+                if (botService.bot) {
+                    botService.bot.stopPolling();
+                    console.log('✅ Бот остановлен');
+                }
+                
+                console.log('👋 Приложение завершено');
+                process.exit(0);
+                
+            } catch (error) {
+                console.error('❌ Ошибка при завершении:', error);
+                process.exit(1);
+            }
+        };
+        
+        // Обработка сигналов завершения
+        process.on('SIGTERM', () => shutdown('SIGTERM'));
+        process.on('SIGINT', () => shutdown('SIGINT'));
+        
+        // Обработка необработанных ошибок
+        process.on('uncaughtException', (error) => {
+            console.error('🔥 Необработанная ошибка:', error);
+        });
+        
+        process.on('unhandledRejection', (reason, promise) => {
+            console.error('🔥 Необработанный rejection:', reason);
+        });
+    }
+}
+
+// Запуск приложения
+const app = new Application();
+app.start();
